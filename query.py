@@ -38,6 +38,7 @@ pinecone_index = pc.Index(PINECONE_INDEX_NAME)
 try:
     db_conn = mysql.connector.connect(
         host="crossover.proxy.rlwy.net",
+        port=57490,
         user="root",
         password="yKbGScLCUBxgrzZRyXIrCixYUWuQjJIE",
         database="Credable"
