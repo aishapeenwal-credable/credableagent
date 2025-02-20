@@ -41,7 +41,7 @@ try:
         port=57490,
         user="root",
         password="yKbGScLCUBxgrzZRyXIrCixYUWuQjJIE",
-        database="Credable"
+        database="Credable prod"
     )
 except mysql.connector.Error as e:
     print(f"Error connecting to MySQL database: {e}")
