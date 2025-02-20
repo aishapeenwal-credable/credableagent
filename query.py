@@ -37,9 +37,9 @@ pinecone_index = pc.Index(PINECONE_INDEX_NAME)
 # Initialize MySQL Connection
 try:
     db_conn = mysql.connector.connect(
-        host="localhost",
+        host="mysql--x_g.railway.internal",
         user="root",
-        password="aisha@123",
+        password="yKbGScLCUBxgrzZRyXIrCixYUWuQjJIE",
         database="Credable"
     )
 except mysql.connector.Error as e:
