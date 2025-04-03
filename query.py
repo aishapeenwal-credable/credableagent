@@ -2,13 +2,14 @@ import os
 import mysql.connector
 from flask import Flask, request, jsonify
 import openai
-from pinecone import Pinecone
-from pinecone import ServerlessSpec
+from pinecone import Pinecone, ServerlessSpec
 import json
 from datetime import datetime
+from flask_cors import CORS
 
 # Initialize Flask App
 app = Flask(__name__)
+CORS(app)
 
 # Hardcoded API Keys
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -19,36 +20,19 @@ PINECONE_INDEX_NAME = "applicationjson"
 # Initialize OpenAI
 openai.api_key = OPENAI_API_KEY
 
-# Initialize Pinecone Client (NEW METHOD)
+# Initialize Pinecone Client
 pc = Pinecone(api_key=PINECONE_API_KEY)
-
-# Check if index exists, else create it
 if PINECONE_INDEX_NAME not in pc.list_indexes().names():
     pc.create_index(
-        name=PINECONE_INDEX_NAME, 
-        dimension=1536,  # Update to match OpenAI's embedding size
+        name=PINECONE_INDEX_NAME,
+        dimension=1024,
         metric="cosine",
         spec=ServerlessSpec(cloud="aws", region="us-east-1")
     )
-
-# Connect to existing Pinecone index
 pinecone_index = pc.Index(PINECONE_INDEX_NAME)
 
-# Initialize MySQL Connection
-try:
-    db_conn = mysql.connector.connect(
-        host="crossover.proxy.rlwy.net",
-        port=57490,
-        user="root",
-        password="yKbGScLCUBxgrzZRyXIrCixYUWuQjJIE",
-        database="Credable prod"
-    )
-except mysql.connector.Error as e:
-    print(f"Error connecting to MySQL database: {e}")
-    db_conn = None
-
+# Database Connection
 def get_db_connection():
-    """Establish and return a database connection."""
     try:
         db_conn = mysql.connector.connect(
             host=os.getenv("DB_HOST", "localhost"),
@@ -61,47 +45,43 @@ def get_db_connection():
         print(f"Error connecting to MySQL database: {e}")
         return None
 
-def serialize_pinecone_results(results):
-    """Convert Pinecone ScoredVector objects into JSON-serializable format."""
-    serialized_results = []
-    for result in results:
-        serialized_results.append({
-            "id": result.id,
-            "score": result.score,
-            "metadata": result.metadata
-        })
-    return serialized_results
+# Serialize Pinecone Results
 
-def save_log_to_db(query, application_id, response, metadata=None):
-    """Save query, response, and metadata to the log table."""
+def serialize_pinecone_results(results):
+    return [
+        {"id": result.id, "score": result.score, "metadata": result.metadata}
+        for result in results
+    ]
+
+# Get Last 5 Logs for Chain of Thought
+
+def get_last_five_logs(application_id):
     db_conn = get_db_connection()
     if db_conn is None:
-        print("Database connection is not available.")
-        return
+        return []
 
     try:
-        cursor = db_conn.cursor()
-        
-        # ✅ Convert Pinecone results to a JSON-serializable format
-        if metadata and "matched_files" in metadata:
-            metadata["matched_files"] = serialize_pinecone_results(metadata["matched_files"])
-
-        metadata_json = json.dumps(metadata) if metadata else None
-        query_str = """
-            INSERT INTO log (query, application_id, response, metadata)
-            VALUES (%s, %s, %s, %s);
+        cursor = db_conn.cursor(dictionary=True)
+        query = """
+            SELECT query, response 
+            FROM log_1 
+            WHERE application_id = %s 
+            ORDER BY id DESC 
+            LIMIT 1;
         """
-        cursor.execute(query_str, (query, application_id, response, metadata_json))
-        db_conn.commit()
+        cursor.execute(query, (application_id,))
+        logs = cursor.fetchall()
         cursor.close()
+        return logs[::-1]
     except mysql.connector.Error as e:
-        print(f"Database error: {e}")
+        print(f"Database error fetching logs: {e}")
+        return []
     finally:
         db_conn.close()
 
+# Vectorize Query
 
 def get_query_vector(query):
-    """Convert the query into a vector using OpenAI embeddings."""
     try:
         response = openai.Embedding.create(
             model="text-embedding-ada-002",
@@ -112,30 +92,26 @@ def get_query_vector(query):
         print(f"Error generating query vector: {e}")
         return None
 
+# Semantic Search
 
 def query_pinecone_semantic(query_vector):
-    """Perform semantic search in Pinecone using the query vector."""
     if query_vector is None:
         return []
 
     try:
         results = pinecone_index.query(
             vector=query_vector,
-            top_k=50,  # Number of results to retrieve
+            top_k=50,
             include_metadata=True
         )
-
-        if "matches" in results:
-            return results["matches"]
-        else:
-            return []
+        return results.get("matches", [])
     except Exception as e:
         print(f"Error querying Pinecone: {e}")
         return []
 
+# Construct Context
 
 def construct_context(pinecone_results):
-    """Dynamically construct context from Pinecone query results."""
     if not pinecone_results:
         return "No relevant data available in context."
 
@@ -146,82 +122,139 @@ def construct_context(pinecone_results):
             context_lines.append(f"{key.replace('_', ' ').title()}: {value}")
     return "\n".join(context_lines)
 
+# Generate Answer
 
-def answer_query_with_openai(query, context):
-    """Generate a response using OpenAI GPT with the provided query and context."""
+def answer_query_with_openai(query, context, history_context=""):
     try:
         prompt = f"""
-You are a senior credit underwriter analyzing a loan application. Understand the indian underwriting scenario and the indian business registrations and terms, then analyse the loan application, background , financials, company strcuture, triangulate all the data provided across company and provide data and numbers- add rationale. Do not make assumptions or include information that is not explicitly provided.
+You are a senior credit underwriter assessing a business loan application in the Indian regulatory and financial context. Use the chain of thought technique by analyzing current and past queries to deepen your understanding. Analyze the application using only explicitly provided data—no assumptions or hypotheticals.
+
+---
+
+Conversation History:
+{history_context if history_context else "No prior queries."}
+
+---
 
 Relevant Context:
 {context}
 
-Query:
+---
+
+New Query:
 {query}
 
 Answer:
 """
         response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",  # Use "gpt-4" for better performance if needed
+            model="gpt-4.5-preview",
             messages=[
                 {"role": "system", "content": "You are a financial assistant."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=500
+            max_tokens=2000
         )
         return response["choices"][0]["message"]["content"].strip()
     except Exception as e:
         print(f"Error generating response with OpenAI: {e}")
         return "An error occurred while generating the response."
 
+# Query Handler
 
 @app.route('/query', methods=['POST'])
 def handle_query():
-    """Handle incoming queries and generate responses."""
     try:
         data = request.json
         query = data.get("query")
-        application_id = data.get("application_id")  # ✅ Extract application_id from request
+        application_id = data.get("application_id")
 
         if not query:
             return jsonify({"error": "Query is required"}), 400
-        
         if not application_id:
-            return jsonify({"error": "Application ID is required"}), 400  # ✅ Ensure application_id is provided
+            return jsonify({"error": "Application ID is required"}), 400
 
-        # Generate query vector
         query_vector = get_query_vector(query)
         if not query_vector:
             return jsonify({"error": "Failed to generate query vector"}), 500
 
-        # Perform semantic search in Pinecone
         pinecone_results = query_pinecone_semantic(query_vector)
         if not pinecone_results:
             return jsonify({"error": "No relevant data found"}), 404
 
-        # Dynamically construct context
         context = construct_context(pinecone_results)
-        print(f"Constructed Context: {context}")  # Debug log
 
-        # Generate a response using OpenAI
-        response = answer_query_with_openai(query, context)
-        print(f"OpenAI Response: {response}")  # Debug log
+        # Fetch last 5 queries for chain of thought
+        conversation_history = get_last_five_logs(application_id)
+        history_lines = [f"Q{idx+1}: {log_1['query']}\nA{idx+1}: {log_1['response']}" for idx, log_1 in enumerate(conversation_history)]
+        history_context = "\n\n".join(history_lines)
 
-        # Save log to the database with application_id
-        save_log_to_db(query, application_id, response, metadata={"matched_files": pinecone_results})
+        response = answer_query_with_openai(query, context, history_context)
 
-        return jsonify({"query": query, "response": response})
-    
+        db_conn = get_db_connection()
+        cursor = db_conn.cursor()
+        metadata_json = json.dumps({"matched_files": serialize_pinecone_results(pinecone_results)}) if pinecone_results else None
+        query_str = """
+            INSERT INTO log_1 (query, application_id, response, metadata)
+            VALUES (%s, %s, %s, %s);
+        """
+        cursor.execute(query_str, (query, application_id, response, metadata_json))
+        db_conn.commit()
+        query_id = cursor.lastrowid
+        cursor.close()
+        db_conn.close()
+
+        return jsonify({"query": query, "response": response, "query_id": query_id})
+
     except Exception as e:
-        print(f"Error handling the query: {e}")  # Full error printout
         import traceback
-        traceback.print_exc()  # Print full stack trace for debugging
+        traceback.print_exc()
         return jsonify({"error": f"Internal error: {str(e)}"}), 500
 
+# Save Correction
 
-# Start the Flask server
+def update_correction_in_db(query_id, correction):
+    db_conn = get_db_connection()
+    if db_conn is None:
+        return {"error": "Database connection unavailable"}
+
+    try:
+        cursor = db_conn.cursor()
+        update_query = """
+            UPDATE log_1 
+            SET correction = %s
+            WHERE id = %s;
+        """
+        cursor.execute(update_query, (correction, query_id))
+        db_conn.commit()
+        cursor.close()
+        return {"message": "Correction updated successfully"}
+    except mysql.connector.Error as e:
+        return {"error": str(e)}
+    finally:
+        db_conn.close()
+
+@app.route("/save_correction", methods=["POST"])
+def save_correction():
+    data = request.get_json()
+    correction_text = data.get("correction", "").strip()
+    query_id = data.get("query_id")
+
+    if not correction_text:
+        return jsonify({"error": "Correction text is required"}), 400
+    if not query_id:
+        return jsonify({"error": "Query ID is required"}), 400
+
+    try:
+        result = update_correction_in_db(query_id, correction_text)
+        if "error" in result:
+            return jsonify(result), 500
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Run Flask App
 if __name__ == "__main__":
     try:
-        app.run(debug=True, port=5007)
+        app.run(debug=True, port=5000)
     except Exception as e:
         print(f"Error starting Flask server: {e}")
