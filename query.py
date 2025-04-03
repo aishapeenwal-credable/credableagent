@@ -6,6 +6,8 @@ from pinecone import Pinecone, ServerlessSpec
 import json
 from datetime import datetime
 from flask_cors import CORS
+from dotenv import load_dotenv
+load_dotenv()
 
 # Initialize Flask App
 app = Flask(__name__)
@@ -35,10 +37,10 @@ pinecone_index = pc.Index(PINECONE_INDEX_NAME)
 def get_db_connection():
     try:
         db_conn = mysql.connector.connect(
-            host=os.getenv("DB_HOST", "localhost"),
-            user=os.getenv("DB_USER", "root"),
-            password=os.getenv("DB_PASSWORD", "aisha@123"),
-            database=os.getenv("DB_NAME", "Credable")
+            host=os.getenv("DB_HOST"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            database=os.getenv("DB_NAME")
         )
         return db_conn
     except mysql.connector.Error as e:
