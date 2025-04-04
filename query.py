@@ -1,27 +1,27 @@
 import os
 import psycopg2
-import psycopg2.extras
-from flask import Flask, request, jsonify
-import openai
+from psycopg2.extras import RealDictCursor
+from flask import Flask, request, jsonify, send_file
+from openai import OpenAI
 from pinecone import Pinecone, ServerlessSpec
 import json
 from datetime import datetime
 from flask_cors import CORS
-from dotenv import load_dotenv
-load_dotenv()
+import plotly.io as pio
+import plotly.graph_objects as go
 
 # Initialize Flask App
 app = Flask(__name__)
 CORS(app)
 
-# Hardcoded API Keys
+# .env api keys
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_ENV = os.getenv("PINECONE_ENV")
 PINECONE_INDEX_NAME = "applicationjson"
 
-# Initialize OpenAI
-openai.api_key = OPENAI_API_KEY
+# Initialize OpenAI Client
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Initialize Pinecone Client
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -50,22 +50,33 @@ def get_db_connection():
         return None
 
 # Serialize Pinecone Results
-
 def serialize_pinecone_results(results):
     return [
         {"id": result.id, "score": result.score, "metadata": result.metadata}
         for result in results
     ]
+# Construct Context
+def construct_context(pinecone_results):
+    if not pinecone_results:
+        return "No relevant data available in context."
+
+    context_lines = []
+    for result in pinecone_results:
+        metadata = result.get("metadata", {})
+        for key, value in metadata.items():
+            context_lines.append(f"{key.replace('_', ' ').title()}: {value}")
+    return "\n".join(context_lines)
+
 
 # Get Last 5 Logs for Chain of Thought
-
 def get_last_five_logs(application_id):
     db_conn = get_db_connection()
     if db_conn is None:
         return []
 
     try:
-        cursor = db_conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cursor = db_conn.cursor(cursor_factory=RealDictCursor)
+
         query = """
             SELECT query, response 
             FROM log_1 
@@ -84,53 +95,33 @@ def get_last_five_logs(application_id):
         db_conn.close()
 
 # Vectorize Query
-
 def get_query_vector(query):
     try:
-        response = openai.Embedding.create(
+        response = client.embeddings.create(
             model="text-embedding-ada-002",
             input=query
         )
-        return response['data'][0]['embedding']
+        return response.data[0].embedding
     except Exception as e:
         print(f"Error generating query vector: {e}")
         return None
 
-# Semantic Search
-
-def query_pinecone_semantic(query_vector):
-    if query_vector is None:
-        return []
-
+# Patch for ChatCompletion (use OpenAI v1+ format)
+def chat_completion(messages, model="gpt-4.5-preview", max_tokens=2000):
     try:
-        results = pinecone_index.query(
-            vector=query_vector,
-            top_k=50,
-            include_metadata=True
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens
         )
-        return results.get("matches", [])
+        return response.choices[0].message.content.strip()
     except Exception as e:
-        print(f"Error querying Pinecone: {e}")
-        return []
-
-# Construct Context
-
-def construct_context(pinecone_results):
-    if not pinecone_results:
-        return "No relevant data available in context."
-
-    context_lines = []
-    for result in pinecone_results:
-        metadata = result.get("metadata", {})
-        for key, value in metadata.items():
-            context_lines.append(f"{key.replace('_', ' ').title()}: {value}")
-    return "\n".join(context_lines)
+        print(f"Error generating response with OpenAI: {e}")
+        return "An error occurred while generating the response."
 
 # Generate Answer
-
 def answer_query_with_openai(query, context, history_context=""):
-    try:
-        prompt = f"""
+    prompt = f"""
 You are a senior credit underwriter assessing a business loan application in the Indian regulatory and financial context. Use the chain of thought technique by analyzing current and past queries to deepen your understanding. Analyze the application using only explicitly provided data—no assumptions or hypotheticals.
 
 ---
@@ -150,72 +141,13 @@ New Query:
 
 Answer:
 """
-        response = openai.ChatCompletion.create(
-            model="gpt-4.5-preview",
-            messages=[
-                {"role": "system", "content": "You are a financial assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=2000
-        )
-        return response["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"Error generating response with OpenAI: {e}")
-        return "An error occurred while generating the response."
-
-# Query Handler
-
-@app.route('/query', methods=['POST'])
-def handle_query():
-    try:
-        data = request.json
-        query = data.get("query")
-        application_id = data.get("application_id")
-
-        if not query:
-            return jsonify({"error": "Query is required"}), 400
-        if not application_id:
-            return jsonify({"error": "Application ID is required"}), 400
-
-        query_vector = get_query_vector(query)
-        if not query_vector:
-            return jsonify({"error": "Failed to generate query vector"}), 500
-
-        pinecone_results = query_pinecone_semantic(query_vector)
-        if not pinecone_results:
-            return jsonify({"error": "No relevant data found"}), 404
-
-        context = construct_context(pinecone_results)
-
-        # Fetch last 5 queries for chain of thought
-        conversation_history = get_last_five_logs(application_id)
-        history_lines = [f"Q{idx+1}: {log_1['query']}\nA{idx+1}: {log_1['response']}" for idx, log_1 in enumerate(conversation_history)]
-        history_context = "\n\n".join(history_lines)
-
-        response = answer_query_with_openai(query, context, history_context)
-
-        db_conn = get_db_connection()
-        cursor = db_conn.cursor()
-        metadata_json = json.dumps({"matched_files": serialize_pinecone_results(pinecone_results)}) if pinecone_results else None
-        query_str = """
-            INSERT INTO log_1 (query, application_id, response, metadata) VALUES (%s, %s, %s, %s);
-
-        """
-        cursor.execute(query_str, (query, application_id, response, metadata_json))
-        db_conn.commit()
-        query_id = cursor.lastrowid
-        cursor.close()
-        db_conn.close()
-
-        return jsonify({"query": query, "response": response, "query_id": query_id})
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": f"Internal error: {str(e)}"}), 500
+    messages = [
+        {"role": "system", "content": "You are a financial assistant."},
+        {"role": "user", "content": prompt}
+    ]
+    return chat_completion(messages)
 
 # Save Correction
-
 def update_correction_in_db(query_id, correction):
     db_conn = get_db_connection()
     if db_conn is None:
@@ -255,6 +187,143 @@ def save_correction():
         return jsonify(result), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+# Query Handler
+@app.route('/query', methods=['POST'])
+def handle_query():
+    try:
+        data = request.json
+        query = data.get("query")
+        application_id = data.get("application_id")
+
+        if not query:
+            return jsonify({"error": "Query is required"}), 400
+        if not application_id:
+            return jsonify({"error": "Application ID is required"}), 400
+
+        query_vector = get_query_vector(query)
+        if not query_vector:
+            return jsonify({"error": "Failed to generate query vector"}), 500
+
+        pinecone_results = pinecone_index.query(
+            vector=query_vector,
+            top_k=50,
+            include_metadata=True
+        ).get("matches", [])
+
+        if not pinecone_results:
+            return jsonify({"error": "No relevant data found"}), 404
+
+        context = construct_context(pinecone_results)
+        conversation_history = get_last_five_logs(application_id)
+        history_lines = [f"Q{idx+1}: {log_1['query']}\nA{idx+1}: {log_1['response']}" for idx, log_1 in enumerate(conversation_history)]
+        history_context = "\n\n".join(history_lines)
+
+        response = answer_query_with_openai(query, context, history_context)
+
+        db_conn = get_db_connection()
+        cursor = db_conn.cursor()
+        metadata_json = json.dumps({"matched_files": serialize_pinecone_results(pinecone_results)}) if pinecone_results else None
+        query_str = """
+            INSERT INTO log_1 (query, application_id, response, metadata)
+            VALUES (%s, %s, %s, %s);
+        """
+        cursor.execute(query_str, (query, application_id, response, metadata_json))
+        db_conn.commit()
+        query_id = cursor.lastrowid
+        cursor.close()
+        db_conn.close()
+
+        return jsonify({"query": query, "response": response, "query_id": query_id})
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Internal error: {str(e)}"}), 500
+
+# Visualization Endpoint
+@app.route('/visualise', methods=['POST'])
+def visualise_response():
+    data = request.get_json()
+    response_text = data.get("response", "")
+
+    if not response_text:
+        return jsonify({"error": "Response text required"}), 400
+
+    visualization_prompt = f"""
+You are a data visualization expert. Analyze the following response text carefully:
+
+{response_text}
+
+Decide if this data can be meaningfully visualized using a single Plotly graph. 
+
+If yes:
+- Clearly state "YES"
+- Provide explicit Plotly Python JSON instructions in the 'plotly_instruction' field including title, axis labels, and legend.
+
+If visualization does not apply or isn't clear:
+- Clearly state "NO"
+- Return an empty object for 'plotly_instruction'.
+
+Respond in the following strict JSON format:
+{{
+  "can_visualize": "YES or NO",
+  "plotly_instruction": {{...}}
+}}
+"""
+
+    try:
+        messages = [
+            {"role": "system", "content": "You're a visualization assistant."},
+            {"role": "user", "content": visualization_prompt}
+        ]
+        llm_response = chat_completion(messages, max_tokens=1500).strip()
+
+        # Normalize Markdown-wrapped JSON (e.g., ```json\n{...}\n```)
+        if llm_response.startswith("```json"):
+            llm_response = llm_response.replace("```json", "").replace("```", "").strip()
+        elif llm_response.startswith("```"):
+            llm_response = llm_response.replace("```", "").strip()
+
+        # Optional debug logging
+        print("Cleaned LLM Response:", repr(llm_response))
+
+        try:
+            parsed_response = json.loads(llm_response)
+        except json.JSONDecodeError as e:
+            return jsonify({
+                "error": "Failed to parse JSON from LLM response",
+                "raw_response": llm_response,
+                "debug": str(e)
+            }), 500
+
+
+        # DEBUG: Log raw response
+        print("Raw LLM Response:", repr(llm_response))
+
+        # Ensure the response is valid JSON
+        try:
+            parsed_response = json.loads(llm_response)
+        except json.JSONDecodeError as e:
+            return jsonify({
+                "error": "Malformed LLM response",
+                "raw_response": llm_response,
+                "debug": str(e)
+            }), 500
+
+        can_visualize = parsed_response.get("can_visualize", "NO") == "YES"
+        plotly_instruction = parsed_response.get("plotly_instruction", {}) if can_visualize else {}
+
+        return jsonify({
+            "can_visualize": can_visualize,
+            "plotly_instruction": plotly_instruction
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
 
 # Run Flask App
 if __name__ == "__main__":
