@@ -1,5 +1,6 @@
 import os
-import mysql.connector
+import psycopg2
+import psycopg2.extras
 from flask import Flask, request, jsonify
 import openai
 from pinecone import Pinecone, ServerlessSpec
@@ -36,15 +37,16 @@ pinecone_index = pc.Index(PINECONE_INDEX_NAME)
 # Database Connection
 def get_db_connection():
     try:
-        db_conn = mysql.connector.connect(
+        conn = psycopg2.connect(
             host=os.getenv("DB_HOST"),
+            port=os.getenv("DB_PORT"),
             user=os.getenv("DB_USER"),
             password=os.getenv("DB_PASSWORD"),
-            database=os.getenv("DB_NAME")
+            dbname=os.getenv("DB_NAME")
         )
-        return db_conn
-    except mysql.connector.Error as e:
-        print(f"Error connecting to MySQL database: {e}")
+        return conn
+    except psycopg2.Error as e:
+        print(f"Error connecting to PostgreSQL database: {e}")
         return None
 
 # Serialize Pinecone Results
@@ -63,7 +65,7 @@ def get_last_five_logs(application_id):
         return []
 
     try:
-        cursor = db_conn.cursor(dictionary=True)
+        cursor = db_conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         query = """
             SELECT query, response 
             FROM log_1 
@@ -75,7 +77,7 @@ def get_last_five_logs(application_id):
         logs = cursor.fetchall()
         cursor.close()
         return logs[::-1]
-    except mysql.connector.Error as e:
+    except psycopg2.Error as e:
         print(f"Database error fetching logs: {e}")
         return []
     finally:
@@ -196,8 +198,8 @@ def handle_query():
         cursor = db_conn.cursor()
         metadata_json = json.dumps({"matched_files": serialize_pinecone_results(pinecone_results)}) if pinecone_results else None
         query_str = """
-            INSERT INTO log_1 (query, application_id, response, metadata)
-            VALUES (%s, %s, %s, %s);
+            INSERT INTO log_1 (query, application_id, response, metadata) VALUES (%s, %s, %s, %s);
+
         """
         cursor.execute(query_str, (query, application_id, response, metadata_json))
         db_conn.commit()
@@ -230,7 +232,7 @@ def update_correction_in_db(query_id, correction):
         db_conn.commit()
         cursor.close()
         return {"message": "Correction updated successfully"}
-    except mysql.connector.Error as e:
+    except psycopg2.Error as e:
         return {"error": str(e)}
     finally:
         db_conn.close()
