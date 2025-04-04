@@ -5,3 +5,4 @@ openai==1.70.0
 pinecone-client==5.0.1
 plotly==6.0.1
 python-dotenv==1.0.1
+gunicorn
